@@ -13,6 +13,9 @@
 
 #define peq(aa, bb) (((intptr_t)aa) == ((intptr_t)bb))
 
+// Max offset of a cell that can be possibly be on hold . 
+#define MAX_INDEX ((1 << 16) - 1)
+
 typedef uint16_t u16;
 typedef uint8_t u8;
 
@@ -108,7 +111,6 @@ list_length(u16 off)
     }
 
     cell* item = o2p(off);
-  //  printf("ll,ofs:%d \n" , off);
     return 1 + list_length(item->next);
 }
 
@@ -148,8 +150,7 @@ insert_free(u16 coff, cell* item)
     bytes_freed = bytes_freed + ALLOC_UNIT * item->size;
     blocks_freed = blocks_freed + 1;
     u16 i_coff = p2o(item);
-    printf("insert free ! , item_ofs : %d , item_size : %d , free_list : %d \n" , coff , item->size , free_list);	  
-	 
+
     u16 p_coff = free_list; 
     for (u16 c_coff = free_list; (p_coff != 0);)
     {
@@ -184,25 +185,25 @@ insert_free(u16 coff, cell* item)
 	  {
             p_cell->size = p_cell->size + i_cell->size + c_cell->size;
             p_cell->next = c_cell->next;	    
-	  }
+	  } // Check for coalescence with previous node only
           else if((p_coff + p_cell->size) == i_coff) 
 	  {
 	    p_cell->size = p_cell->size + i_cell->size;
             p_cell->next = c_coff;	       	  
-	  }
+	  } // Check for coalescence with next node 
           else if((i_coff + i_cell->size) == c_coff)
 	  {
 	    p_cell->next = i_coff;	  
 	    i_cell->size = i_cell->size + c_cell->size;
             i_cell->next = c_cell->next;	       	  	  
-	  }
+	  } // In case of no coalescence chip the node in between . 
           else
 	  {
 	    p_cell->next = i_coff;
             i_cell->next = c_coff;	    
 	  }	  
 	}
-        return 0;	
+	return 0;	
       }
       p_coff = c_coff;
       c_coff = c_cell->next;
@@ -210,6 +211,9 @@ insert_free(u16 coff, cell* item)
     return -1;
 }
 
+// Scan the used list, to see if the pointer found on stack
+// as any match in used list cells . If so fill up the cell offset
+// and return .
 int
 find_ptr_gc_used_list(intptr_t address , u16* cell_offset)
 {
@@ -256,36 +260,6 @@ gc_init(void* main_frame)
     free_list = 1;
 }
 
-#if 0
-static
-void
-check_list(u16 coff)
-{
-    assert(bytes_freed <= bytes_allocated);
-    if (coff == 0) {
-        return;
-    }
-
-    cell* cc = o2p(coff);
-    assert(7*cc->size == cc->conf);
-    check_list(cc->next);
-}
-
-static
-void
-print_list(u16 off)
-{
-    if (off == 0) {
-        printf("list done");
-        return;
-    }
-
-    cell* item = o2p(off);
-    print_cell(item);
-    print_list(item->next);
-}
-#endif
-
 static
 int
 div_round_up(int num, int den)
@@ -298,7 +272,6 @@ static
 void*
 gc_malloc1(size_t bytes)
 {
-   // check_list(used_list);
 
     u16 units = (u16)div_round_up(bytes + sizeof(cell), ALLOC_UNIT);
 
@@ -333,17 +306,24 @@ gc_malloc1(size_t bytes)
               *pptr = cc->next;	    
 	    }
 
+	    // Check for any out of bounds increment of block
+	    // if there is any , then we need not perform 
+	    // an allocation and perform a garbage collection 
+	    // to avoid incorrect allocation . 
+	    if(*pptr >= MAX_INDEX)
+	    {
+	      return 0;	    
+	    }
+
 	    dd->mark = GC_NO_MARK;
-	  //  printf("malloc , cell_ofs : %d \n" , p2o(dd));
             insert_used(dd);
-           
+          
             void* addr = (void*)(dd + 1);
             memset(addr, 0x7F, bytes);
 
             assert(dd->size == units);
             assert(dd->conf == 7*dd->size);
 
-            //check_list(used_list);
             return addr;
         }
     }
@@ -381,7 +361,6 @@ void
 mark_range(intptr_t bot, intptr_t top)
 {
 
-//  printf("mark_range : chunk_bot : %lx , chunk_top : %lx \n " , bot ,top);
 
   // Scan the memory region as below and see if the 
   // scanned space contains any pointer to stack . 
@@ -399,8 +378,8 @@ mark_range(intptr_t bot, intptr_t top)
       gc_cell_ptr->mark = gc_cell_ptr->mark | GC_MARK;
       intptr_t gc_cell_bot = (intptr_t)gc_cell_ptr + sizeof(cell);
       intptr_t gc_cell_top = (intptr_t)gc_cell_bot + ALLOC_UNIT*gc_cell_ptr->size - sizeof(cell);
-     // printf("stack_addr_val:%lx,i:%lx",stack_addr_val,i);
-     // printf("mark hit - gc_cell_bot:%lx,gc_cell_top:%lx,cell_ofs:%d\n",gc_cell_bot,gc_cell_top,cell_offset);
+     // Since a hit was found in the used list , perform a Depth First Search assuming it to be root
+     // through the memory region of root .
       mark_range(gc_cell_bot,gc_cell_top);
     }
   }
@@ -410,8 +389,6 @@ static
 void
 mark()
 {
- // intptr_t chunk_bot = (intptr_t)chunk_base;
- // intptr_t chunk_top = chunk_bot + CHUNK_SIZE;
 
   intptr_t stack_bot = 0;
   intptr_t bot = (intptr_t)&stack_bot;
@@ -436,7 +413,7 @@ void
 sweep()
 {
     // For each item on the used list, check if it's been
-    // marked. If not, free it - probalby by calling insert_free.
+    // marked. If not, free it - probably by calling insert_free.
   u16* pptr = &used_list;  
   for (cell* cc = o2p(used_list); cc; cc = o2p(*pptr)) 
   {
@@ -446,8 +423,11 @@ sweep()
       // If cell is marked , then remove it from used list as below
       // and insert it onto free_list . 	    
       cc->used = 0;
-     // printf("sweep : cell_ofs : %d \n " , p2o(cc));
-      insert_free(p2o(cc),cc);      
+      if(insert_free(p2o(cc),cc) != 0)
+      {
+        printf(" Insert free fails !  , cell_ofs : %d \n" , p2o(cc));
+        assert(0);	
+      }      
     }
     else
     {
